@@ -1,0 +1,141 @@
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://postgres:postgres@db:5432/proinvoice
+  REDIS_URL: redis://redis:6379/0
+  SECRET_KEY: ${SECRET_KEY:-dev-secret-change-in-production}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASS: ${SMTP_PASS:-}
+  WISE_API_TOKEN: ${WISE_API_TOKEN:-}
+  WISE_PROFILE_ID: ${WISE_PROFILE_ID:-}
+  REVOLUT_API_TOKEN: ${REVOLUT_API_TOKEN:-}
+  REVOLUT_ACCOUNT_ID: ${REVOLUT_ACCOUNT_ID:-}
+  UPLOAD_DIR: /app/uploads
+  LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  GOOGLE_MODEL: ${GOOGLE_MODEL:-gemini-1.5-flash}
+  # Bind mounts do not deliver inotify events inside containers; poll instead.
+  WATCHFILES_FORCE_POLLING: "true"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: proinvoice
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    build: ./backend
+    command:
+      - python
+      - run_with_reload.py
+      - celery
+      - -A
+      - celery_app.celery
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - uploads:/app/uploads
+
+  beat:
+    build: ./backend
+    command:
+      - python
+      - run_with_reload.py
+      - celery
+      - -A
+      - celery_app.celery
+      - beat
+      - --loglevel=info
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./portal
+      target: dev
+    command: ["npm", "run", "dev"]
+    environment:
+      # Empty = relative URLs, served through the Vite dev proxy.
+      VITE_API_URL: ""
+      VITE_API_PROXY_TARGET: http://backend:8000
+      VITE_USE_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./portal:/app
+      # Anonymous volume keeps the image's node_modules (installed for Linux)
+      # visible under the bind-mounted source tree.
+      - /app/node_modules
+
+volumes:
+  pgdata:
+  uploads:
